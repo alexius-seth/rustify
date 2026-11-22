@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.31"
+egui_extras = "0.31"
 rodio = { version = "0.20", features = ["symphonia-all"] }
 lofty = "0.22"
 walkdir = "2.5"

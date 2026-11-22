@@ -5,12 +5,18 @@ mod storage;
 mod ui;
 
 use audio::AudioEngine;
-use eframe::egui::{self, Color32, ColorImage, RichText, Stroke, TextureHandle, TextureOptions};
+use eframe::egui::{
+    self, Color32, ColorImage, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+};
+use egui_extras::{Column, TableBuilder};
 use models::{PlaybackState, Playlist, Track};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use ui::TagEditorState;
+use ui::{
+    BEVEL_LIGHT, CHARCOAL_BG, PHOSPHOR_GREEN, SLATE_DARK, SLATE_PANEL, SPOTIFY_EMERALD,
+    TagEditorState, WINAMP_CYAN,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
@@ -22,8 +28,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RUSTIFY // Lightweight Audio Engine")
-            .with_inner_size([1100.0, 730.0])
-            .with_min_inner_size([880.0, 580.0]),
+            .with_inner_size([1120.0, 740.0])
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
@@ -39,14 +45,20 @@ fn main() -> eframe::Result<()> {
 
 fn apply_hybrid_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(18, 18, 18); // #121212
-    visuals.window_fill = Color32::from_rgb(35, 37, 54); // #232536
-    visuals.extreme_bg_color = Color32::from_rgb(0, 0, 0); // #000000
+    visuals.panel_fill = CHARCOAL_BG;
+    visuals.window_fill = SLATE_PANEL;
+    visuals.extreme_bg_color = Color32::from_rgb(10, 10, 14);
 
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(48, 51, 74);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(69, 73, 106));
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(64, 68, 98);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(29, 185, 84); // #1DB954
+    // Subtle dark inputs & hover states
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 32, 46);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BEVEL_LIGHT);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 50, 72);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(36, 46, 42);
+
+    // Replace default baby-blue selection highlight with dark slate-emerald tint
+    visuals.selection.bg_fill = Color32::from_rgb(32, 46, 40);
+    visuals.selection.stroke = Stroke::new(1.0_f32, SPOTIFY_EMERALD);
+
     ctx.set_visuals(visuals);
 }
 
@@ -76,6 +88,10 @@ struct RustifyApp {
     search_query: String,
     tag_drawer_open: bool,
     tag_editor: TagEditorState,
+    muted: bool,
+    pre_mute_volume: f32,
+    add_songs_modal_open: bool,
+    add_songs_filter: String,
 }
 
 impl RustifyApp {
@@ -101,6 +117,10 @@ impl RustifyApp {
             search_query: String::new(),
             tag_drawer_open: false,
             tag_editor: TagEditorState::default(),
+            muted: false,
+            pre_mute_volume: 0.8,
+            add_songs_modal_open: false,
+            add_songs_filter: String::new(),
         }
     }
 
@@ -108,6 +128,14 @@ impl RustifyApp {
         self.cover_texture = None;
         if let Some(bytes) = library::extract_cover_bytes(path) {
             self.cover_texture = load_texture_from_bytes(ctx, "active_cover", &bytes);
+        }
+    }
+
+    fn select_track_only(&mut self, ctx: &egui::Context, path: &Path) {
+        if let Some(track) = self.tracks.iter().find(|t| t.path == path).cloned() {
+            self.selected_track_path = Some(track.path.clone());
+            self.tag_editor.load_from_track(&track);
+            self.reload_cover_texture(ctx, &track.path);
         }
     }
 
@@ -227,11 +255,115 @@ impl RustifyApp {
         Some(tex)
     }
 
-    fn render_playlist_banner(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p_idx: usize) {
-        let slate_panel = Color32::from_rgb(35, 37, 54);
-        let cyan_badge = Color32::from_rgb(122, 162, 247);
-        let phosphor_green = Color32::from_rgb(0, 255, 65);
+    /// Resolves a single thumbnail for a playlist (custom cover first, then first track with embedded art).
+    fn resolve_playlist_thumb(&mut self, ctx: &egui::Context, pl: &Playlist) -> Option<TextureHandle> {
+        if let Some(custom_path) = &pl.cover_path {
+            if let Some(tex) = self.get_or_load_image_file(ctx, custom_path) {
+                return Some(tex);
+            }
+        }
+        for t_path in &pl.track_paths {
+            if let Some(tex) = self.get_or_load_track_art(ctx, t_path) {
+                return Some(tex);
+            }
+        }
+        None
+    }
 
+  fn render_sidebar_playlists(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let count = self.playlists.len();
+        // Scale cover art dynamically with sidebar width (44px at default width up to 92px)
+        let cover_size = ((ui.available_width() - 120.0) * 0.65).clamp(44.0, 92.0);
+
+        for p_idx in 0..count {
+            let pl = self.playlists[p_idx].clone();
+            let selected = self.active_view == ActiveView::Playlist(p_idx);
+            let thumb = self.resolve_playlist_thumb(ctx, &pl);
+
+            let row_height = if thumb.is_some() { cover_size + 10.0 } else { 26.0 };
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), Sense::click());
+
+            let bg = if selected {
+                Color32::from_rgb(32, 46, 40)
+            } else if response.hovered() {
+                Color32::from_rgb(46, 50, 72)
+            } else {
+                Color32::TRANSPARENT
+            };
+
+            if bg != Color32::TRANSPARENT {
+                ui.painter().rect_filled(rect, 3.0_f32, bg);
+            }
+            if selected {
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0_f32,
+                    Stroke::new(1.0_f32, SPOTIFY_EMERALD),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            let mut text_left = rect.left() + 8.0;
+
+            if let Some(tex) = thumb {
+                let img_rect = Rect::from_min_size(
+                    egui::pos2(rect.left() + 5.0, rect.center().y - cover_size * 0.5),
+                    Vec2::new(cover_size, cover_size),
+                );
+                ui.painter().image(
+                    tex.id(),
+                    img_rect,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                ui::paint_bevel(ui.painter(), img_rect, false);
+                text_left = img_rect.right() + 10.0;
+            }
+
+            let title_color = if selected {
+                SPOTIFY_EMERALD
+            } else if response.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::LIGHT_GRAY
+            };
+
+            if cover_size >= 52.0 && rect.height() > 40.0 {
+                // Two-line stacked title + track count when cover is large
+                ui.painter().text(
+                    egui::pos2(text_left, rect.center().y - 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    &pl.name,
+                    egui::FontId::proportional(14.0),
+                    title_color,
+                );
+                ui.painter().text(
+                    egui::pos2(text_left, rect.center().y + 9.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{} tracks", pl.track_paths.len()),
+                    egui::FontId::monospace(11.0),
+                    Color32::GRAY,
+                );
+            } else {
+                let label_text = format!("{} ({})", pl.name, pl.track_paths.len());
+                ui.painter().text(
+                    egui::pos2(text_left, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label_text,
+                    egui::FontId::proportional(13.5),
+                    title_color,
+                );
+            }
+
+            if response.clicked() {
+                self.active_view = ActiveView::Playlist(p_idx);
+            }
+            ui.add_space(4.0);
+        }
+    }
+
+    fn render_playlist_banner(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p_idx: usize) {
         let Some(playlist) = self.playlists.get(p_idx).cloned() else {
             return;
         };
@@ -241,7 +373,6 @@ impl RustifyApp {
             .as_ref()
             .and_then(|p| self.get_or_load_image_file(ctx, p));
 
-        // Gather up to 4 unique track cover textures for the 2x2 Spotify collage fallback
         let mut collage_textures: Vec<TextureHandle> = Vec::new();
         if custom_tex.is_none() {
             for t_path in &playlist.track_paths {
@@ -256,35 +387,34 @@ impl RustifyApp {
             }
         }
 
-        egui::Frame::new()
-            .fill(slate_panel)
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(69, 73, 106)))
-            .inner_margin(12.0)
+        let resp = egui::Frame::new()
+            .fill(SLATE_PANEL)
+            .inner_margin(14.0)
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    // 104x104 Cover Art (Custom Image, 2x2 Collage, or Retro Fallback)
                     if let Some(tex) = custom_tex {
-                        ui.image((tex.id(), egui::vec2(104.0, 104.0)));
+                        ui.image((tex.id(), Vec2::new(104.0, 104.0)));
                     } else if collage_textures.len() >= 4 {
                         egui::Grid::new("playlist_collage_2x2")
                             .spacing([2.0, 2.0])
                             .show(ui, |ui| {
-                                ui.image((collage_textures[0].id(), egui::vec2(51.0, 51.0)));
-                                ui.image((collage_textures[1].id(), egui::vec2(51.0, 51.0)));
+                                ui.image((collage_textures[0].id(), Vec2::new(51.0, 51.0)));
+                                ui.image((collage_textures[1].id(), Vec2::new(51.0, 51.0)));
                                 ui.end_row();
-                                ui.image((collage_textures[2].id(), egui::vec2(51.0, 51.0)));
-                                ui.image((collage_textures[3].id(), egui::vec2(51.0, 51.0)));
+                                ui.image((collage_textures[2].id(), Vec2::new(51.0, 51.0)));
+                                ui.image((collage_textures[3].id(), Vec2::new(51.0, 51.0)));
                                 ui.end_row();
                             });
                     } else if let Some(first_tex) = collage_textures.first() {
-                        ui.image((first_tex.id(), egui::vec2(104.0, 104.0)));
+                        ui.image((first_tex.id(), Vec2::new(104.0, 104.0)));
                     } else {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(104.0, 104.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0_f32, Color32::BLACK);
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(104.0, 104.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0_f32, Color32::BLACK);
                         ui.painter().rect_stroke(
                             rect,
-                            2.0_f32,
-                            Stroke::new(1.0_f32, cyan_badge),
+                            1.0_f32,
+                            Stroke::new(1.0_f32, WINAMP_CYAN),
                             egui::StrokeKind::Inside,
                         );
                         ui.painter().text(
@@ -292,24 +422,38 @@ impl RustifyApp {
                             egui::Align2::CENTER_CENTER,
                             "PLAYLIST",
                             egui::FontId::monospace(12.0),
-                            phosphor_green,
+                            PHOSPHOR_GREEN,
                         );
                     }
 
-                    ui.add_space(14.0);
+                    ui.add_space(16.0);
 
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("CUSTOM PLAYLIST").monospace().small().color(cyan_badge));
-                        ui.label(RichText::new(&playlist.name).size(24.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new("CUSTOM PLAYLIST").monospace().small().color(WINAMP_CYAN));
+                        ui.label(RichText::new(&playlist.name).size(26.0).strong().color(Color32::WHITE));
                         ui.label(
                             RichText::new(format!("{} tracks", playlist.track_paths.len()))
                                 .small()
                                 .color(Color32::LIGHT_GRAY),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
 
-                        ui.horizontal(|ui| {
-                            if ui.button(RichText::new("[SET COVER]").monospace().small()).clicked() {
+                       ui.horizontal(|ui| {
+                            if ui::hardware_button(
+                                ui,
+                                "+ ADD SONGS",
+                                Vec2::new(98.0, 24.0),
+                                self.add_songs_modal_open,
+                                SPOTIFY_EMERALD,
+                            )
+                            .clicked()
+                            {
+                                self.add_songs_modal_open = !self.add_songs_modal_open;
+                                self.add_songs_filter.clear();
+                            }
+
+                            ui.add_space(6.0);
+                            if ui::hardware_button(ui, "SET COVER", Vec2::new(88.0, 24.0), false, WINAMP_CYAN).clicked() {
                                 if let Some(img) = rfd::FileDialog::new()
                                     .add_filter("Cover Image", &["png", "jpg", "jpeg"])
                                     .pick_file()
@@ -324,35 +468,32 @@ impl RustifyApp {
                                 }
                             }
 
-                            if ui
-                                .button(
-                                    RichText::new("[DELETE PLAYLIST]")
-                                        .monospace()
-                                        .small()
-                                        .color(Color32::from_rgb(255, 110, 110)),
-                                )
-                                .clicked()
+                            ui.add_space(6.0);
+                            if ui::hardware_button(
+                                ui,
+                                "DELETE PLAYLIST",
+                                Vec2::new(124.0, 24.0),
+                                false,
+                                Color32::from_rgb(255, 110, 110),
+                            )
+                            .clicked()
                             {
                                 self.playlists.remove(p_idx);
                                 storage::save_playlists(&self.playlists);
                                 self.active_view = ActiveView::AllSongs;
+                                self.add_songs_modal_open = false;
                             }
                         });
                     });
                 });
             });
-        ui.add_space(8.0);
+        ui::paint_bevel(ui.painter(), resp.response.rect, false);
+        ui.add_space(10.0);
     }
 }
 
 impl eframe::App for RustifyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let slate_panel = Color32::from_rgb(35, 37, 54);
-        let charcoal_bg = Color32::from_rgb(18, 18, 18);
-        let phosphor_green = Color32::from_rgb(0, 255, 65);
-        let emerald = Color32::from_rgb(29, 185, 84);
-        let cyan_badge = Color32::from_rgb(122, 162, 247);
-
         let finished = self.audio.as_ref().map(|a| a.is_finished()).unwrap_or(false);
         if finished {
             let queue = self.visible_track_paths();
@@ -394,35 +535,31 @@ impl eframe::App for RustifyApp {
         let total_secs = active_track.as_ref().map(|t| t.duration_secs).unwrap_or(0);
 
         // 1. BOTTOM NOW-PLAYING DECK
-        egui::TopBottomPanel::bottom("now_playing_bar")
+        let bottom_resp = egui::TopBottomPanel::bottom("now_playing_bar")
             .exact_height(92.0)
-            .frame(egui::Frame::new().fill(slate_panel).inner_margin(12.0))
+            .frame(egui::Frame::new().fill(SLATE_PANEL).inner_margin(12.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(tex) = &self.cover_texture {
-                        ui.image((tex.id(), egui::vec2(60.0, 60.0)));
+                        let resp = ui.image((tex.id(), Vec2::new(62.0, 62.0)));
+                        ui::paint_bevel(ui.painter(), resp.rect, false);
                     } else {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(60.0, 60.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0_f32, Color32::BLACK);
-                        ui.painter().rect_stroke(
-                            rect,
-                            2.0_f32,
-                            Stroke::new(1.0_f32, cyan_badge),
-                            egui::StrokeKind::Inside,
-                        );
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(62.0, 62.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0_f32, Color32::BLACK);
+                        ui::paint_bevel(ui.painter(), rect, true);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "DISC",
                             egui::FontId::monospace(12.0),
-                            phosphor_green,
+                            PHOSPHOR_GREEN,
                         );
                     }
 
                     ui.add_space(10.0);
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(230.0, 64.0),
+                        Vec2::new(240.0, 64.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             if let Some(track) = &active_track {
@@ -439,7 +576,7 @@ impl eframe::App for RustifyApp {
                                     RichText::new(format!("[{} · {:.1} kHz]", ext, khz))
                                         .monospace()
                                         .small()
-                                        .color(cyan_badge),
+                                        .color(WINAMP_CYAN),
                                 );
                             } else {
                                 ui.label(RichText::new("No Track Selected").strong().color(Color32::WHITE));
@@ -452,38 +589,35 @@ impl eframe::App for RustifyApp {
 
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("|<<").clicked() {
+                            if ui::hardware_button(ui, "|<<", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
                                 self.play_relative(ctx, -1);
                             }
-                            let play_label = match playback_state {
-                                PlaybackState::Playing => " || ",
-                                _ => "  >  ",
-                            };
-                            if ui.button(RichText::new(play_label).strong().color(emerald)).clicked() {
+                            let is_playing = playback_state == PlaybackState::Playing;
+                            let play_label = if is_playing { "||" } else { ">" };
+                            if ui::hardware_button(ui, play_label, Vec2::new(44.0, 26.0), is_playing, SPOTIFY_EMERALD).clicked() {
                                 if playback_state == PlaybackState::Stopped {
                                     self.play_relative(ctx, 0);
                                 } else if let Some(audio) = &mut self.audio {
                                     audio.toggle_play_pause();
                                 }
                             }
-                            if ui.button(" [] ").clicked() {
+                            if ui::hardware_button(ui, "[]", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
                                 if let Some(audio) = &mut self.audio {
                                     audio.stop();
                                 }
                             }
-                            if ui.button(">>|").clicked() {
+                            if ui::hardware_button(ui, ">>|", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
                                 self.play_relative(ctx, 1);
                             }
                         });
 
+                        ui.add_space(6.0);
+
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format_secs(elapsed_secs)).monospace().small().color(Color32::LIGHT_GRAY));
                             let mut pos_f32 = elapsed_secs.min(total_secs) as f32;
-                            let max_f32 = (total_secs.max(1)) as f32;
-                            let slider = egui::Slider::new(&mut pos_f32, 0.0..=max_f32)
-                                .show_value(false)
-                                .trailing_fill(true);
-                            if ui.add_sized([240.0, 16.0], slider).changed() {
+                            let max_f32 = total_secs.max(1) as f32;
+                            if ui::emerald_slider(ui, &mut pos_f32, max_f32, 260.0, Color32::from_rgb(200, 205, 220)) {
                                 if let Some(audio) = &mut self.audio {
                                     audio.seek(Duration::from_secs(pos_f32 as u64));
                                 }
@@ -493,52 +627,78 @@ impl eframe::App for RustifyApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let tag_btn = ui.selectable_label(
-                            self.tag_drawer_open,
-                            RichText::new(" [TAG] ").monospace().strong(),
-                        );
-                        if tag_btn.clicked() {
+                        if ui::hardware_button(ui, "TAG", Vec2::new(52.0, 28.0), self.tag_drawer_open, PHOSPHOR_GREEN).clicked() {
                             self.tag_drawer_open = !self.tag_drawer_open;
                         }
 
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         if let Some(audio) = &mut self.audio {
                             let mut vol = audio.volume;
-                            if ui
-                                .add_sized([90.0, 18.0], egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
-                                .changed()
-                            {
+                            if ui::emerald_slider(ui, &mut vol, 1.0, 96.0, SPOTIFY_EMERALD) {
                                 audio.set_volume(vol);
+                                self.muted = vol == 0.0;
                             }
-                            ui.label(RichText::new("Vol").small().color(Color32::LIGHT_GRAY));
+                            ui.add_space(6.0);
+                            let vol_label = if self.muted || audio.volume == 0.0 { "MUTE" } else { "VOL" };
+                            if ui::hardware_button(ui, vol_label, Vec2::new(42.0, 22.0), self.muted, Color32::from_rgb(255, 110, 110)).clicked() {
+                                if self.muted {
+                                    audio.set_volume(self.pre_mute_volume);
+                                    self.muted = false;
+                                } else {
+                                    self.pre_mute_volume = audio.volume.max(0.2);
+                                    audio.set_volume(0.0);
+                                    self.muted = true;
+                                }
+                            }
                         }
                     });
                 });
             });
+        ui::paint_bevel(
+            &ctx.layer_painter(egui::LayerId::background()),
+            bottom_resp.response.rect,
+            false,
+        );
 
         // 2. LEFT NAVIGATION SIDEBAR + WINAMP LCD TELEMETRY BOX
         egui::SidePanel::left("sidebar")
-            .exact_width(230.0)
-            .frame(egui::Frame::new().fill(slate_panel).inner_margin(12.0))
+            .resizable(true)
+            .default_width(250.0)
+            .width_range(210.0..=440.0)
+            .frame(egui::Frame::new().fill(SLATE_PANEL).inner_margin(12.0))
             .show(ctx, |ui| {
-                ui.label(RichText::new("RUSTIFY // 2.9").monospace().strong().size(16.0).color(phosphor_green));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("RUSTIFY").monospace().strong().size(17.0).color(PHOSPHOR_GREEN));
+                    ui.label(RichText::new("// 2.9").monospace().size(13.0).color(WINAMP_CYAN));
+                });
                 ui.separator();
 
                 ui.label(RichText::new("LIBRARY").small().strong().color(Color32::LIGHT_GRAY));
+                ui.add_space(4.0);
                 let is_all = self.active_view == ActiveView::AllSongs;
-                if ui
-                    .selectable_label(
-                        is_all,
-                        RichText::new(format!("All Songs ({})", self.tracks.len()))
-                            .color(if is_all { emerald } else { Color32::WHITE }),
-                    )
-                    .clicked()
+                if ui::hardware_button(
+                    ui,
+                    &format!("ALL SONGS ({})", self.tracks.len()),
+                    Vec2::new(ui.available_width(), 26.0),
+                    is_all,
+                    SPOTIFY_EMERALD,
+                )
+                .clicked()
                 {
                     self.active_view = ActiveView::AllSongs;
                     self.search_query.clear();
                 }
 
-                if ui.button("+ Import Folder").clicked() {
+                ui.add_space(4.0);
+                if ui::hardware_button(
+                    ui,
+                    "+ IMPORT FOLDER",
+                    Vec2::new(ui.available_width(), 26.0),
+                    false,
+                    WINAMP_CYAN,
+                )
+                .clicked()
+                {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.tracks = library::scan_folder(&folder);
                         storage::save_library(&self.tracks);
@@ -551,17 +711,18 @@ impl eframe::App for RustifyApp {
                     }
                 }
 
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 ui.label(RichText::new("PLAYLISTS").small().strong().color(Color32::LIGHT_GRAY));
+                ui.add_space(4.0);
 
                 if self.creating_playlist {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.new_playlist_name)
                                 .hint_text("Playlist name...")
-                                .desired_width(130.0),
+                                .desired_width(140.0),
                         );
-                        if ui.button("Add").clicked() {
+                        if ui::hardware_button(ui, "OK", Vec2::new(38.0, 22.0), true, SPOTIFY_EMERALD).clicked() {
                             let trimmed = self.new_playlist_name.trim().to_string();
                             if !trimmed.is_empty() {
                                 self.playlists.push(Playlist {
@@ -576,25 +737,25 @@ impl eframe::App for RustifyApp {
                             self.creating_playlist = false;
                         }
                     });
-                } else if ui.button("+ New Playlist").clicked() {
+                } else if ui::hardware_button(
+                    ui,
+                    "+ NEW PLAYLIST",
+                    Vec2::new(ui.available_width(), 24.0),
+                    false,
+                    Color32::WHITE,
+                )
+                .clicked()
+                {
                     self.creating_playlist = true;
                 }
 
-                ui.add_space(4.0);
-                for (p_idx, pl) in self.playlists.iter().enumerate() {
-                    let selected = self.active_view == ActiveView::Playlist(p_idx);
-                    let label = RichText::new(format!("• {} ({})", pl.name, pl.track_paths.len()))
-                        .color(if selected { emerald } else { Color32::LIGHT_GRAY });
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.active_view = ActiveView::Playlist(p_idx);
-                    }
-                }
+                ui.add_space(6.0);
+                self.render_sidebar_playlists(ctx, ui);
 
                 // Bottom-anchored Winamp Pitch-Black LCD Screen + Live Spectrum Analyzer
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    egui::Frame::new()
+                    let lcd_resp = egui::Frame::new()
                         .fill(Color32::BLACK)
-                        .stroke(Stroke::new(1.5_f32, Color32::from_rgb(69, 73, 106)))
                         .inner_margin(10.0)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -602,9 +763,9 @@ impl eframe::App for RustifyApp {
                                 ui.label(
                                     RichText::new(format_secs(elapsed_secs))
                                         .monospace()
-                                        .size(20.0)
+                                        .size(22.0)
                                         .strong()
-                                        .color(phosphor_green),
+                                        .color(PHOSPHOR_GREEN),
                                 );
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -614,21 +775,24 @@ impl eframe::App for RustifyApp {
                                         RichText::new(format!("{:>3} kbps\n{:.1} kHz", kbps, khz))
                                             .monospace()
                                             .small()
-                                            .color(cyan_badge),
+                                            .color(WINAMP_CYAN),
                                     );
                                 });
                             });
                             ui.add_space(6.0);
                             ui::draw_winamp_spectrum(ui, playback_state, elapsed.as_secs_f32());
                         });
+                    ui::paint_bevel(ui.painter(), lcd_resp.response.rect, true);
                 });
             });
 
         // 3. COLLAPSIBLE WINAMP TAG EDITOR DRAWER
         if self.tag_drawer_open {
             egui::TopBottomPanel::bottom("tag_editor_drawer")
-                .exact_height(155.0)
-                .frame(egui::Frame::new().fill(Color32::from_rgb(28, 30, 44)).inner_margin(12.0))
+                .resizable(true)
+                .default_height(165.0)
+                .height_range(145.0..=340.0)
+                .frame(egui::Frame::new().fill(SLATE_DARK).inner_margin(12.0))
                 .show(ctx, |ui| {
                     let save_clicked = ui::render_tag_editor_drawer(
                         ui,
@@ -644,7 +808,7 @@ impl eframe::App for RustifyApp {
 
         // 4. CENTRAL TRACK LIBRARY / PLAYLIST VIEW
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(charcoal_bg).inner_margin(16.0))
+            .frame(egui::Frame::new().fill(CHARCOAL_BG).inner_margin(16.0))
             .show(ctx, |ui| {
                 if let ActiveView::Playlist(p_idx) = self.active_view {
                     self.render_playlist_banner(ctx, ui, p_idx);
@@ -655,9 +819,10 @@ impl eframe::App for RustifyApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text("Filter by title, artist, or album...")
-                            .desired_width(320.0),
+                            .desired_width(340.0),
                     );
                 });
+                ui.add_space(6.0);
                 ui.separator();
 
                 let visible_paths = self.visible_track_paths();
@@ -666,62 +831,124 @@ impl eframe::App for RustifyApp {
                     ui.centered_and_justified(|ui| {
                         let msg = match self.active_view {
                             ActiveView::AllSongs => {
-                                "Your library is empty.\nClick '+ Import Folder' in the sidebar to scan local music."
+                                "Your library is empty.\nClick '+ IMPORT FOLDER' in the sidebar to scan local music."
                             }
                             ActiveView::Playlist(_) => {
-                                "This playlist has no songs yet.\nGo to 'All Songs' and click '+ PL' on any track to add it here."
+                                "This playlist has no songs yet.\nGo to 'ALL SONGS' and click '+ PL' on any track to add it here."
                             }
                         };
                         ui.label(RichText::new(msg).color(Color32::GRAY));
                     });
                 } else {
                     let query = self.search_query.to_lowercase();
-                    let mut clicked_path: Option<PathBuf> = None;
-                    let mut remove_from_playlist_idx: Option<usize> = None;
+                    let filtered_tracks: Vec<Track> = visible_paths
+                        .iter()
+                        .filter_map(|p| self.tracks.iter().find(|t| &t.path == p).cloned())
+                        .filter(|t| {
+                            query.is_empty()
+                                || t.title.to_lowercase().contains(&query)
+                                || t.artist.to_lowercase().contains(&query)
+                                || t.album.to_lowercase().contains(&query)
+                        })
+                        .collect();
+
+                    let mut play_path: Option<PathBuf> = None;
+                    let mut edit_path: Option<PathBuf> = None;
+                    let mut remove_from_playlist_path: Option<PathBuf> = None;
                     let mut add_to_playlist: Option<(usize, PathBuf)> = None;
+                    ui.visuals_mut().selection.bg_fill = Color32::from_rgb(32, 46, 40);
+                    ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, SPOTIFY_EMERALD);
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        egui::Grid::new("track_table")
-                            .num_columns(6)
-                            .spacing([16.0, 8.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.label(RichText::new("#").strong().color(Color32::GRAY));
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(false)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::exact(36.0))
+                        .column(Column::remainder().at_least(220.0))
+                        .column(Column::initial(160.0).at_least(110.0))
+                        .column(Column::initial(160.0).at_least(110.0))
+                        .column(Column::exact(64.0))
+                        .column(Column::exact(84.0))
+                        .header(26.0, |mut header| {
+                            header.col(|ui| {
+                                ui.label(RichText::new("#").monospace().strong().color(Color32::GRAY));
+                            });
+                            header.col(|ui| {
                                 ui.label(RichText::new("TITLE").strong().color(Color32::GRAY));
+                            });
+                            header.col(|ui| {
                                 ui.label(RichText::new("ARTIST").strong().color(Color32::GRAY));
+                            });
+                            header.col(|ui| {
                                 ui.label(RichText::new("ALBUM").strong().color(Color32::GRAY));
-                                ui.label(RichText::new("TIME").strong().color(Color32::GRAY));
-                                ui.label(RichText::new("PLAYLIST").strong().color(Color32::GRAY));
-                                ui.end_row();
+                            });
+                            header.col(|ui| {
+                                ui.label(RichText::new("TIME").monospace().strong().color(Color32::GRAY));
+                            });
+                            header.col(|ui| {
+                                ui.label(RichText::new("ACTION").strong().color(Color32::GRAY));
+                            });
+                        })
+                        .body(|mut body| {
+                            for (row_idx, track) in filtered_tracks.iter().enumerate() {
+                                let is_selected = self.selected_track_path.as_ref() == Some(&track.path);
+                                let title_color = if is_selected { SPOTIFY_EMERALD } else { Color32::WHITE };
 
-                                for (row_idx, path) in visible_paths.iter().enumerate() {
-                                    let Some(track) = self.tracks.iter().find(|t| &t.path == path) else {
-                                        continue;
-                                    };
+                                body.row(30.0, |mut row| {
+                                    row.set_selected(is_selected);
 
-                                    if !query.is_empty()
-                                        && !track.title.to_lowercase().contains(&query)
-                                        && !track.artist.to_lowercase().contains(&query)
-                                        && !track.album.to_lowercase().contains(&query)
-                                    {
-                                        continue;
-                                    }
+                                    row.col(|ui| {
+                                        let idx_text = if is_selected {
+                                            RichText::new(">").monospace().strong().color(SPOTIFY_EMERALD)
+                                        } else {
+                                            RichText::new(format!("{}", row_idx + 1)).monospace().color(Color32::GRAY)
+                                        };
+                                        ui.label(idx_text);
+                                    });
 
-                                    let is_selected = self.selected_track_path.as_ref() == Some(&track.path);
-                                    let title_color = if is_selected { emerald } else { Color32::WHITE };
+                                    row.col(|ui| {
+                                        let title_resp = ui.add(
+                                            egui::Label::new(RichText::new(&track.title).color(title_color))
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        );
+                                        if title_resp.clicked() {
+                                            play_path = Some(track.path.clone());
+                                        }
+                                        title_resp.context_menu(|ui| {
+                                            if ui.button("Play Now").clicked() {
+                                                play_path = Some(track.path.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Edit Tags & Cover").clicked() {
+                                                edit_path = Some(track.path.clone());
+                                                ui.close_menu();
+                                            }
+                                            if !self.playlists.is_empty() {
+                                                ui.separator();
+                                                for (p_i, pl) in self.playlists.iter().enumerate() {
+                                                    if ui.button(format!("Add to '{}'", pl.name)).clicked() {
+                                                        add_to_playlist = Some((p_i, track.path.clone()));
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    });
 
-                                    ui.label(RichText::new(format!("{}", row_idx + 1)).monospace().color(Color32::GRAY));
-                                    if ui
-                                        .selectable_label(is_selected, RichText::new(&track.title).color(title_color))
-                                        .clicked()
-                                    {
-                                        clicked_path = Some(track.path.clone());
-                                    }
-                                    ui.label(RichText::new(&track.artist).color(Color32::LIGHT_GRAY));
-                                    ui.label(RichText::new(&track.album).color(Color32::GRAY));
-                                    ui.label(RichText::new(track.formatted_duration()).monospace().color(Color32::LIGHT_GRAY));
+                                    row.col(|ui| {
+                                        ui.add(egui::Label::new(RichText::new(&track.artist).color(Color32::LIGHT_GRAY)).truncate());
+                                    });
 
-                                    match self.active_view {
+                                    row.col(|ui| {
+                                        ui.add(egui::Label::new(RichText::new(&track.album).color(Color32::GRAY)).truncate());
+                                    });
+
+                                    row.col(|ui| {
+                                        ui.label(RichText::new(track.formatted_duration()).monospace().color(Color32::LIGHT_GRAY));
+                                    });
+
+                                    row.col(|ui| match self.active_view {
                                         ActiveView::AllSongs => {
                                             if self.playlists.is_empty() {
                                                 ui.label(RichText::new("-").small().color(Color32::DARK_GRAY));
@@ -737,19 +964,29 @@ impl eframe::App for RustifyApp {
                                             }
                                         }
                                         ActiveView::Playlist(_) => {
-                                            if ui.button(RichText::new("Remove").small()).clicked() {
-                                                remove_from_playlist_idx = Some(row_idx);
+                                            if ui::hardware_button(
+                                                ui,
+                                                "REMOVE",
+                                                Vec2::new(62.0, 22.0),
+                                                false,
+                                                Color32::from_rgb(255, 110, 110),
+                                            )
+                                            .clicked()
+                                            {
+                                                remove_from_playlist_path = Some(track.path.clone());
                                             }
                                         }
-                                    }
+                                    });
+                                });
+                            }
+                        });
 
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                    if let Some(path) = clicked_path {
+                    if let Some(path) = play_path {
                         self.play_track_by_path(ctx, &path);
+                    }
+                    if let Some(path) = edit_path {
+                        self.select_track_only(ctx, &path);
+                        self.tag_drawer_open = true;
                     }
                     if let Some((p_i, path)) = add_to_playlist {
                         if let Some(pl) = self.playlists.get_mut(p_i) {
@@ -760,18 +997,138 @@ impl eframe::App for RustifyApp {
                             }
                         }
                     }
-                    if let Some(row_idx) = remove_from_playlist_idx {
+                    if let Some(path) = remove_from_playlist_path {
                         if let ActiveView::Playlist(p_idx) = self.active_view {
                             if let Some(pl) = self.playlists.get_mut(p_idx) {
-                                if row_idx < pl.track_paths.len() {
-                                    pl.track_paths.remove(row_idx);
-                                    storage::save_playlists(&self.playlists);
-                                    self.playlist_tex_cache.clear();
-                                }
+                                pl.track_paths.retain(|p| p != &path);
+                                storage::save_playlists(&self.playlists);
+                                self.playlist_tex_cache.clear();
                             }
                         }
                     }
                 }
             });
+
+            // 5. ADD SONGS TO PLAYLIST MODAL PICKER
+        if self.add_songs_modal_open {
+            if let ActiveView::Playlist(p_idx) = self.active_view {
+                let mut open = self.add_songs_modal_open;
+                let pl_name = self
+                    .playlists
+                    .get(p_idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+
+                egui::Window::new(format!("ADD SONGS // {}", pl_name.to_uppercase()))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size([460.0, 380.0])
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .frame(
+                        egui::Frame::window(&ctx.style())
+                            .fill(SLATE_PANEL)
+                            .stroke(Stroke::new(1.5_f32, BEVEL_LIGHT))
+                            .inner_margin(12.0),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Filter:").color(Color32::LIGHT_GRAY));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_songs_filter)
+                                    .hint_text("Search library tracks...")
+                                    .desired_width(280.0),
+                            );
+                        });
+                        ui.separator();
+
+                        if self.tracks.is_empty() {
+                            ui.label(
+                                RichText::new("No songs in library. Click '+ IMPORT FOLDER' first.")
+                                    .color(Color32::GRAY),
+                            );
+                        } else {
+                            let filter = self.add_songs_filter.to_lowercase();
+                            let mut changed = false;
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for track in &self.tracks {
+                                    if !filter.is_empty()
+                                        && !track.title.to_lowercase().contains(&filter)
+                                        && !track.artist.to_lowercase().contains(&filter)
+                                    {
+                                        continue;
+                                    }
+
+                                    let already_added = self
+                                        .playlists
+                                        .get(p_idx)
+                                        .map(|pl| pl.track_paths.contains(&track.path))
+                                        .unwrap_or(false);
+
+                                    ui.horizontal(|ui| {
+                                        let btn_label = if already_added { "ADDED" } else { "+ ADD" };
+                                        let btn_color = if already_added {
+                                            Color32::GRAY
+                                        } else {
+                                            SPOTIFY_EMERALD
+                                        };
+
+                                        if ui::hardware_button(
+                                            ui,
+                                            btn_label,
+                                            Vec2::new(62.0, 22.0),
+                                            already_added,
+                                            btn_color,
+                                        )
+                                        .clicked()
+                                        {
+                                            if let Some(pl) = self.playlists.get_mut(p_idx) {
+                                                if already_added {
+                                                    pl.track_paths.retain(|p| p != &track.path);
+                                                } else {
+                                                    pl.track_paths.push(track.path.clone());
+                                                }
+                                                changed = true;
+                                            }
+                                        }
+
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(&track.title)
+                                                    .color(if already_added {
+                                                        SPOTIFY_EMERALD
+                                                    } else {
+                                                        Color32::WHITE
+                                                    }),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} · {}",
+                                                    track.artist,
+                                                    track.formatted_duration()
+                                                ))
+                                                .small()
+                                                .color(Color32::GRAY),
+                                            );
+                                        });
+                                    });
+                                    ui.separator();
+                                }
+                            });
+
+                            if changed {
+                                storage::save_playlists(&self.playlists);
+                                self.playlist_tex_cache.clear();
+                            }
+                        }
+                    });
+
+                self.add_songs_modal_open = open;
+            } else {
+                self.add_songs_modal_open = false;
+            }
+        }
     }
 }
