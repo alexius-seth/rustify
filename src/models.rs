@@ -34,3 +34,28 @@ pub struct Playlist {
     pub track_paths: Vec<PathBuf>,
     pub cover_path: Option<PathBuf>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn next(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::All,
+            RepeatMode::All => RepeatMode::One,
+            RepeatMode::One => RepeatMode::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RepeatMode::Off => "RPT",
+            RepeatMode::All => "RPT:ALL",
+            RepeatMode::One => "RPT:1",
+        }
+    }
+}

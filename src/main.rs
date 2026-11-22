@@ -6,10 +6,11 @@ mod ui;
 
 use audio::AudioEngine;
 use eframe::egui::{
-    self, Color32, ColorImage, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+    self, Color32, ColorImage, Key, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions,
+    Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use models::{PlaybackState, Playlist, Track};
+use models::{PlaybackState, Playlist, RepeatMode, Track};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -92,6 +93,9 @@ struct RustifyApp {
     pre_mute_volume: f32,
     add_songs_modal_open: bool,
     add_songs_filter: String,
+    shuffle: bool,
+    repeat_mode: RepeatMode,
+    focus_search_next_frame: bool,
 }
 
 impl RustifyApp {
@@ -121,6 +125,9 @@ impl RustifyApp {
             pre_mute_volume: 0.8,
             add_songs_modal_open: false,
             add_songs_filter: String::new(),
+            shuffle: false,
+            repeat_mode: RepeatMode::Off,
+            focus_search_next_frame: false,
         }
     }
 
@@ -167,21 +174,98 @@ impl RustifyApp {
         }
     }
 
-    fn play_relative(&mut self, ctx: &egui::Context, offset: isize) {
+    fn pick_random_index(&self, len: usize, exclude: Option<usize>) -> usize {
+        if len <= 1 {
+            return 0;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let mut idx = nanos % len;
+        if Some(idx) == exclude {
+            idx = (idx + 1) % len;
+        }
+        idx
+    }
+
+    fn advance_track(&mut self, ctx: &egui::Context, auto_advance: bool) {
         let queue = self.visible_track_paths();
         if queue.is_empty() {
             return;
         }
+
+        // Repeat One replays the active track immediately
+        if auto_advance && self.repeat_mode == RepeatMode::One {
+            if let Some(current) = self.selected_track_path.clone() {
+                self.play_track_by_path(ctx, &current);
+                return;
+            }
+        }
+
         let current_pos = self
             .selected_track_path
             .as_ref()
             .and_then(|p| queue.iter().position(|q| q == p));
 
-        let next_idx = match current_pos {
-            Some(pos) => (pos as isize + offset).clamp(0, queue.len() as isize - 1) as usize,
+        if self.shuffle {
+            let next_idx = self.pick_random_index(queue.len(), current_pos);
+            self.play_track_by_path(ctx, &queue[next_idx]);
+            return;
+        }
+
+        match current_pos {
+            Some(pos) if pos + 1 < queue.len() => {
+                self.play_track_by_path(ctx, &queue[pos + 1]);
+            }
+            Some(_) | None => {
+                if self.repeat_mode == RepeatMode::All || !auto_advance {
+                    self.play_track_by_path(ctx, &queue[0]);
+                } else if let Some(audio) = &mut self.audio {
+                    audio.stop();
+                }
+            }
+        }
+    }
+
+    fn play_previous(&mut self, ctx: &egui::Context) {
+        let queue = self.visible_track_paths();
+        if queue.is_empty() {
+            return;
+        }
+
+        // If more than 3 seconds into the song, restart current track first
+        let elapsed_secs = self.audio.as_ref().map(|a| a.position().as_secs()).unwrap_or(0);
+        if elapsed_secs > 3 {
+            if let Some(audio) = &mut self.audio {
+                audio.seek(Duration::ZERO);
+            }
+            return;
+        }
+
+        let current_pos = self
+            .selected_track_path
+            .as_ref()
+            .and_then(|p| queue.iter().position(|q| q == p));
+
+        if self.shuffle {
+            let prev_idx = self.pick_random_index(queue.len(), current_pos);
+            self.play_track_by_path(ctx, &queue[prev_idx]);
+            return;
+        }
+
+        let prev_idx = match current_pos {
+            Some(0) => {
+                if self.repeat_mode == RepeatMode::All {
+                    queue.len() - 1
+                } else {
+                    0
+                }
+            }
+            Some(pos) => pos - 1,
             None => 0,
         };
-        self.play_track_by_path(ctx, &queue[next_idx]);
+        self.play_track_by_path(ctx, &queue[prev_idx]);
     }
 
     fn save_edited_tags(&mut self, ctx: &egui::Context) {
@@ -270,7 +354,7 @@ impl RustifyApp {
         None
     }
 
-  fn render_sidebar_playlists(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn render_sidebar_playlists(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let count = self.playlists.len();
         // Scale cover art dynamically with sidebar width (44px at default width up to 92px)
         let cover_size = ((ui.available_width() - 120.0) * 0.65).clamp(44.0, 92.0);
@@ -330,7 +414,6 @@ impl RustifyApp {
             };
 
             if cover_size >= 52.0 && rect.height() > 40.0 {
-                // Two-line stacked title + track count when cover is large
                 ui.painter().text(
                     egui::pos2(text_left, rect.center().y - 8.0),
                     egui::Align2::LEFT_CENTER,
@@ -438,7 +521,7 @@ impl RustifyApp {
                         );
                         ui.add_space(8.0);
 
-                       ui.horizontal(|ui| {
+                        ui.horizontal(|ui| {
                             if ui::hardware_button(
                                 ui,
                                 "+ ADD SONGS",
@@ -494,18 +577,59 @@ impl RustifyApp {
 
 impl eframe::App for RustifyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.style_mut(|style| {
+            style.visuals.selection.bg_fill = Color32::from_rgb(32, 46, 40);
+            style.visuals.selection.stroke = Stroke::new(1.0_f32, SPOTIFY_EMERALD);
+        });
+
         let finished = self.audio.as_ref().map(|a| a.is_finished()).unwrap_or(false);
         if finished {
-            let queue = self.visible_track_paths();
-            let current_pos = self
-                .selected_track_path
-                .as_ref()
-                .and_then(|p| queue.iter().position(|q| q == p));
-            if let Some(pos) = current_pos {
-                if pos + 1 < queue.len() {
-                    self.play_track_by_path(ctx, &queue[pos + 1]);
+            self.advance_track(ctx, true);
+        }
+
+        // Global Media Keyboard Shortcuts (ignored while typing in Search or Tag Editor inputs)
+        let typing_in_text_field = ctx.wants_keyboard_input();
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
+            self.focus_search_next_frame = true;
+        }
+
+        if !typing_in_text_field {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space)) {
+                let state = self.audio.as_ref().map(|a| a.state).unwrap_or(PlaybackState::Stopped);
+                if state == PlaybackState::Stopped {
+                    self.advance_track(ctx, false);
                 } else if let Some(audio) = &mut self.audio {
-                    audio.stop();
+                    audio.toggle_play_pause();
+                }
+            }
+
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowRight)) {
+                if let Some(audio) = &mut self.audio {
+                    let next_pos = audio.position() + Duration::from_secs(5);
+                    audio.seek(next_pos);
+                }
+            }
+
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft)) {
+                if let Some(audio) = &mut self.audio {
+                    let prev_pos = audio.position().saturating_sub(Duration::from_secs(5));
+                    audio.seek(prev_pos);
+                }
+            }
+
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
+                if let Some(audio) = &mut self.audio {
+                    let vol = (audio.volume + 0.05).min(1.0);
+                    audio.set_volume(vol);
+                    self.muted = false;
+                }
+            }
+
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
+                if let Some(audio) = &mut self.audio {
+                    let vol = (audio.volume - 0.05).max(0.0);
+                    audio.set_volume(vol);
+                    self.muted = vol == 0.0;
                 }
             }
         }
@@ -589,25 +713,58 @@ impl eframe::App for RustifyApp {
 
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            if ui::hardware_button(ui, "|<<", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
-                                self.play_relative(ctx, -1);
+                            if ui::hardware_button(
+                                ui,
+                                "SHF",
+                                Vec2::new(40.0, 26.0),
+                                self.shuffle,
+                                WINAMP_CYAN,
+                            )
+                            .clicked()
+                            {
+                                self.shuffle = !self.shuffle;
                             }
+
+                            if ui::hardware_button(ui, "|<<", Vec2::new(36.0, 26.0), false, Color32::WHITE).clicked() {
+                                self.play_previous(ctx);
+                            }
+
                             let is_playing = playback_state == PlaybackState::Playing;
                             let play_label = if is_playing { "||" } else { ">" };
-                            if ui::hardware_button(ui, play_label, Vec2::new(44.0, 26.0), is_playing, SPOTIFY_EMERALD).clicked() {
+                            if ui::hardware_button(ui, play_label, Vec2::new(42.0, 26.0), is_playing, SPOTIFY_EMERALD).clicked() {
                                 if playback_state == PlaybackState::Stopped {
-                                    self.play_relative(ctx, 0);
+                                    self.advance_track(ctx, false);
                                 } else if let Some(audio) = &mut self.audio {
                                     audio.toggle_play_pause();
                                 }
                             }
-                            if ui::hardware_button(ui, "[]", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
+
+                            if ui::hardware_button(ui, "[]", Vec2::new(36.0, 26.0), false, Color32::WHITE).clicked() {
                                 if let Some(audio) = &mut self.audio {
                                     audio.stop();
                                 }
                             }
-                            if ui::hardware_button(ui, ">>|", Vec2::new(38.0, 26.0), false, Color32::WHITE).clicked() {
-                                self.play_relative(ctx, 1);
+
+                            if ui::hardware_button(ui, ">>|", Vec2::new(36.0, 26.0), false, Color32::WHITE).clicked() {
+                                self.advance_track(ctx, false);
+                            }
+
+                            let rpt_active = self.repeat_mode != RepeatMode::Off;
+                            let rpt_accent = if self.repeat_mode == RepeatMode::One {
+                                PHOSPHOR_GREEN
+                            } else {
+                                WINAMP_CYAN
+                            };
+                            if ui::hardware_button(
+                                ui,
+                                self.repeat_mode.label(),
+                                Vec2::new(62.0, 26.0),
+                                rpt_active,
+                                rpt_accent,
+                            )
+                            .clicked()
+                            {
+                                self.repeat_mode = self.repeat_mode.next();
                             }
                         });
 
@@ -617,7 +774,7 @@ impl eframe::App for RustifyApp {
                             ui.label(RichText::new(format_secs(elapsed_secs)).monospace().small().color(Color32::LIGHT_GRAY));
                             let mut pos_f32 = elapsed_secs.min(total_secs) as f32;
                             let max_f32 = total_secs.max(1) as f32;
-                            if ui::emerald_slider(ui, &mut pos_f32, max_f32, 260.0, Color32::from_rgb(200, 205, 220)) {
+                            if ui::emerald_slider(ui, &mut pos_f32, max_f32, 268.0, Color32::from_rgb(200, 205, 220)) {
                                 if let Some(audio) = &mut self.audio {
                                     audio.seek(Duration::from_secs(pos_f32 as u64));
                                 }
@@ -660,7 +817,7 @@ impl eframe::App for RustifyApp {
             false,
         );
 
-        // 2. LEFT NAVIGATION SIDEBAR + WINAMP LCD TELEMETRY BOX
+        // 2. LEFT NAVIGATION SIDEBAR (Draggable Width + Auto-Scaling Playlist Covers)
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(250.0)
@@ -750,7 +907,12 @@ impl eframe::App for RustifyApp {
                 }
 
                 ui.add_space(6.0);
-                self.render_sidebar_playlists(ctx, ui);
+                let max_pl_height = (ui.available_height() - 115.0).max(60.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_pl_height)
+                    .show(ui, |ui| {
+                        self.render_sidebar_playlists(ctx, ui);
+                    });
 
                 // Bottom-anchored Winamp Pitch-Black LCD Screen + Live Spectrum Analyzer
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -786,7 +948,7 @@ impl eframe::App for RustifyApp {
                 });
             });
 
-        // 3. COLLAPSIBLE WINAMP TAG EDITOR DRAWER
+        // 3. COLLAPSIBLE & DRAGGABLE WINAMP TAG EDITOR DRAWER
         if self.tag_drawer_open {
             egui::TopBottomPanel::bottom("tag_editor_drawer")
                 .resizable(true)
@@ -816,11 +978,15 @@ impl eframe::App for RustifyApp {
 
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Search:").color(Color32::LIGHT_GRAY));
-                    ui.add(
+                    let search_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("Filter by title, artist, or album...")
+                            .hint_text("Filter by title, artist, or album... (Ctrl+F)")
                             .desired_width(340.0),
                     );
+                    if self.focus_search_next_frame {
+                        search_resp.request_focus();
+                        self.focus_search_next_frame = false;
+                    }
                 });
                 ui.add_space(6.0);
                 ui.separator();
@@ -834,7 +1000,7 @@ impl eframe::App for RustifyApp {
                                 "Your library is empty.\nClick '+ IMPORT FOLDER' in the sidebar to scan local music."
                             }
                             ActiveView::Playlist(_) => {
-                                "This playlist has no songs yet.\nGo to 'ALL SONGS' and click '+ PL' on any track to add it here."
+                                "This playlist has no songs yet.\nClick '+ ADD SONGS' above or use '+ PL' in ALL SONGS."
                             }
                         };
                         ui.label(RichText::new(msg).color(Color32::GRAY));
@@ -856,6 +1022,7 @@ impl eframe::App for RustifyApp {
                     let mut edit_path: Option<PathBuf> = None;
                     let mut remove_from_playlist_path: Option<PathBuf> = None;
                     let mut add_to_playlist: Option<(usize, PathBuf)> = None;
+
                     ui.visuals_mut().selection.bg_fill = Color32::from_rgb(32, 46, 40);
                     ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, SPOTIFY_EMERALD);
 
@@ -1009,7 +1176,7 @@ impl eframe::App for RustifyApp {
                 }
             });
 
-            // 5. ADD SONGS TO PLAYLIST MODAL PICKER
+        // 5. ADD SONGS TO PLAYLIST MODAL PICKER
         if self.add_songs_modal_open {
             if let ActiveView::Playlist(p_idx) = self.active_view {
                 let mut open = self.add_songs_modal_open;
