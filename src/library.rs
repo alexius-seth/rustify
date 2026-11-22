@@ -1,9 +1,11 @@
 use crate::models::Track;
-use lofty::config::ParseOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
-use lofty::picture::PictureType;
+use lofty::picture::{Picture, PictureType};
 use lofty::probe::Probe;
-use lofty::tag::Accessor;
+use lofty::tag::{Accessor, Tag, TagExt};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -40,8 +42,7 @@ pub fn read_track_metadata(path: &Path) -> Track {
         .unwrap_or("Unknown Title")
         .to_string();
 
-    let Ok(tagged_file) = Probe::open(path)
-        .and_then(|p| p.options(ParseOptions::new()).read())
+    let Ok(tagged_file) = Probe::open(path).and_then(|p| p.options(ParseOptions::new()).read())
     else {
         return Track {
             path: path.to_path_buf(),
@@ -60,7 +61,10 @@ pub fn read_track_metadata(path: &Path) -> Track {
     let bitrate_kbps = properties.audio_bitrate();
     let sample_rate_hz = properties.sample_rate();
 
-    if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    if let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         let title = tag
             .title()
             .map(|s| s.to_string())
@@ -108,7 +112,9 @@ pub fn read_track_metadata(path: &Path) -> Track {
 /// Extracts front cover bytes (or the first embedded picture) from an audio file.
 pub fn extract_cover_bytes(path: &Path) -> Option<Vec<u8>> {
     let tagged_file = Probe::open(path).ok()?.read().ok()?;
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())?;
 
     let picture = tag
         .pictures()
@@ -117,4 +123,54 @@ pub fn extract_cover_bytes(path: &Path) -> Option<Vec<u8>> {
         .or_else(|| tag.pictures().first())?;
 
     Some(picture.data().to_vec())
+}
+
+/// Saves updated text metadata and optional new cover art image directly to disk.
+pub fn save_track_metadata(
+    path: &Path,
+    title: &str,
+    artist: &str,
+    album: &str,
+    year: Option<u32>,
+    new_cover_path: Option<&Path>,
+) -> Result<(), String> {
+    let mut tagged_file = Probe::open(path)
+        .map_err(|e| format!("Failed to open file: {e}"))?
+        .read()
+        .map_err(|e| format!("Failed to read audio tags: {e}"))?;
+
+    let tag_type = tagged_file.primary_tag_type();
+    if tagged_file.tag(tag_type).is_none() {
+        tagged_file.insert_tag(Tag::new(tag_type));
+    }
+
+    let tag = tagged_file
+        .tag_mut(tag_type)
+        .ok_or_else(|| "File format does not support writable tags".to_string())?;
+
+    tag.set_title(title.trim().to_string());
+    tag.set_artist(artist.trim().to_string());
+    tag.set_album(album.trim().to_string());
+
+    if let Some(y) = year {
+        tag.set_year(y);
+    } else {
+        tag.remove_year();
+    }
+
+    if let Some(img_path) = new_cover_path {
+        let img_file = File::open(img_path).map_err(|e| format!("Cannot open cover image: {e}"))?;
+        let mut reader = BufReader::new(img_file);
+        let mut picture = Picture::from_reader(&mut reader)
+            .map_err(|e| format!("Invalid image file: {e}"))?;
+        picture.set_pic_type(PictureType::CoverFront);
+
+        tag.remove_picture_type(PictureType::CoverFront);
+        tag.push_picture(picture);
+    }
+
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("Failed to save tags to disk: {e}"))?;
+
+    Ok(())
 }
