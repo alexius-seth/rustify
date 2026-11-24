@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
@@ -58,4 +59,17 @@ impl RepeatMode {
             RepeatMode::One => "RPT:1",
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackMetric {
+    pub play_count: u64,
+    pub seconds_listened: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsData {
+    pub total_plays: u64,
+    pub total_seconds_listened: u64,
+    pub per_track: HashMap<PathBuf, TrackMetric>,
 }

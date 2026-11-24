@@ -162,7 +162,7 @@ pub fn emerald_slider(
 
 /// Draws a classic 12-band Winamp Green -> Yellow -> Red LED spectrum analyzer.
 pub fn draw_winamp_spectrum(ui: &mut egui::Ui, state: PlaybackState, elapsed_secs: f32) {
-    let desired_size = Vec2::new(ui.available_width(), 30.0);
+    let desired_size = Vec2::new(ui.available_width().max(80.0), 30.0);
     let (rect, _) = ui.allocate_exact_size(desired_size, Sense::hover());
     let painter = ui.painter();
 
