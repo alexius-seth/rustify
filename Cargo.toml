@@ -10,12 +10,21 @@ rodio = { version = "0.20", features = ["symphonia-all"] }
 lofty = "0.22"
 walkdir = "2.5"
 rfd = "0.15"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", features = ["png", "jpeg", "ico"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+souvlaki = "0.8"
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+souvlaki = "0.8"
+raw-window-handle = "0.6"
+
+
+[build-dependencies]
+winresource = "0.1"

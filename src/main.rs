@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod library;
+mod media_controls;
 mod models;
 mod storage;
 mod ui;
@@ -11,6 +13,7 @@ use eframe::egui::{
     Vec2,
 };
 use egui_extras::{Column, TableBuilder};
+use media_controls::{HardwareMediaCmd, OsMediaBridge};
 use models::{MetricsData, PlaybackState, Playlist, RepeatMode, Track};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,12 +39,29 @@ enum SortColumn {
     Duration,
 }
 
+fn load_window_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/rustify.ico");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("RUSTIFY // Lightweight Audio Engine")
+        .with_inner_size([1120.0, 740.0])
+        .with_min_inner_size([900.0, 600.0]);
+
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RUSTIFY // Lightweight Audio Engine")
-            .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([900.0, 600.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -50,7 +70,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             apply_hybrid_theme(&cc.egui_ctx);
-            Ok(Box::new(RustifyApp::new()))
+            let mut app = RustifyApp::new();
+            app.media_bridge = OsMediaBridge::new(cc);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -91,6 +113,7 @@ fn load_texture_from_bytes(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Opt
 
 struct RustifyApp {
     audio: Option<AudioEngine>,
+    media_bridge: Option<OsMediaBridge>,
     status_msg: String,
     tracks: Vec<Track>,
     playlists: Vec<Playlist>,
@@ -135,6 +158,7 @@ impl RustifyApp {
 
         Self {
             audio,
+            media_bridge: None,
             status_msg,
             tracks,
             playlists,
@@ -192,6 +216,10 @@ impl RustifyApp {
         self.tag_editor.load_from_track(&track);
         self.reload_cover_texture(ctx, &track.path);
         storage::trim_working_set();
+
+        if let Some(bridge) = &mut self.media_bridge {
+            bridge.set_metadata(&track);
+        }
 
         if let Some(audio) = &mut self.audio {
             match audio.play_file(&track.path) {
@@ -354,20 +382,47 @@ impl RustifyApp {
         self.play_track_by_path(ctx, &queue[prev_idx]);
     }
 
-    fn import_audio_files(&mut self, paths: Vec<PathBuf>) {
-        let mut added = 0;
+    fn import_audio_files(&mut self, paths: Vec<PathBuf>, target_playlist: Option<usize>) {
+        let mut added_to_lib = 0;
+        let mut added_to_pl = 0;
+
         for path in paths {
             if !self.tracks.iter().any(|t| t.path == path) {
                 let track = library::read_track_metadata(&path);
                 self.tracks.push(track);
-                added += 1;
+                added_to_lib += 1;
+            }
+
+            if let Some(p_idx) = target_playlist {
+                if let Some(pl) = self.playlists.get_mut(p_idx) {
+                    if !pl.track_paths.contains(&path) {
+                        pl.track_paths.push(path);
+                        added_to_pl += 1;
+                    }
+                }
             }
         }
-        if added > 0 {
+
+        if added_to_lib > 0 {
             storage::save_library(&self.tracks);
+        }
+        if added_to_pl > 0 {
+            storage::save_playlists(&self.playlists);
+        }
+        if added_to_lib > 0 || added_to_pl > 0 {
             self.playlist_tex_cache.clear();
             storage::trim_working_set();
-            self.status_msg = format!("Imported {} track(s)", added);
+            self.status_msg = match target_playlist {
+                Some(p_idx) => {
+                    let name = self
+                        .playlists
+                        .get(p_idx)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("playlist");
+                    format!("Added {} track(s) to '{}'", added_to_pl, name)
+                }
+                None => format!("Imported {} track(s)", added_to_lib),
+            };
         }
     }
 
@@ -436,6 +491,10 @@ impl RustifyApp {
                 self.tag_editor.feedback_msg = "Tags & cover saved to file!".to_string();
                 self.reload_cover_texture(ctx, &updated.path);
                 storage::trim_working_set();
+
+                if let Some(bridge) = &mut self.media_bridge {
+                    bridge.set_metadata(&updated);
+                }
 
                 if was_playing {
                     if let Some(audio) = &mut self.audio {
@@ -690,7 +749,7 @@ impl RustifyApp {
                         );
                         ui.add_space(8.0);
 
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui::hardware_button(
                                 ui,
                                 "+ ADD SONGS",
@@ -704,7 +763,43 @@ impl RustifyApp {
                                 self.add_songs_filter.clear();
                             }
 
-                            ui.add_space(6.0);
+                            if ui::hardware_button(
+                                ui,
+                                "+ FOLDER",
+                                Vec2::new(82.0, 24.0),
+                                false,
+                                WINAMP_CYAN,
+                            )
+                            .clicked()
+                            {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    let scanned = library::scan_folder(&folder);
+                                    let paths: Vec<PathBuf> =
+                                        scanned.into_iter().map(|t| t.path).collect();
+                                    self.import_audio_files(paths, Some(p_idx));
+                                }
+                            }
+
+                            if ui::hardware_button(
+                                ui,
+                                "+ FILES",
+                                Vec2::new(72.0, 24.0),
+                                false,
+                                SPOTIFY_EMERALD,
+                            )
+                            .clicked()
+                            {
+                                if let Some(files) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Audio Files",
+                                        &["mp3", "flac", "wav", "ogg", "m4a", "aac"],
+                                    )
+                                    .pick_files()
+                                {
+                                    self.import_audio_files(files, Some(p_idx));
+                                }
+                            }
+
                             if ui::hardware_button(ui, "SET COVER", Vec2::new(88.0, 24.0), false, WINAMP_CYAN).clicked() {
                                 if let Some(img) = rfd::FileDialog::new()
                                     .add_filter("Cover Image", &["png", "jpg", "jpeg"])
@@ -721,7 +816,6 @@ impl RustifyApp {
                                 }
                             }
 
-                            ui.add_space(6.0);
                             if ui::hardware_button(
                                 ui,
                                 "DELETE PLAYLIST",
@@ -974,6 +1068,53 @@ impl eframe::App for RustifyApp {
             style.visuals.selection.stroke = Stroke::new(1.0_f32, SPOTIFY_EMERALD);
         });
 
+        // Poll Bluetooth / wired earphone & Windows SMTC media transport commands
+        let pending_media_cmds = self
+            .media_bridge
+            .as_ref()
+            .map(|b| b.poll())
+            .unwrap_or_default();
+
+        for cmd in pending_media_cmds {
+            match cmd {
+                HardwareMediaCmd::Play => {
+                    if let Some(audio) = &mut self.audio {
+                        if audio.state == PlaybackState::Stopped {
+                            self.advance_track(ctx, false);
+                        } else if audio.state == PlaybackState::Paused {
+                            audio.toggle_play_pause();
+                        }
+                    }
+                }
+                HardwareMediaCmd::Pause => {
+                    if let Some(audio) = &mut self.audio {
+                        if audio.state == PlaybackState::Playing {
+                            audio.toggle_play_pause();
+                        }
+                    }
+                }
+                HardwareMediaCmd::Toggle => {
+                    let state = self
+                        .audio
+                        .as_ref()
+                        .map(|a| a.state)
+                        .unwrap_or(PlaybackState::Stopped);
+                    if state == PlaybackState::Stopped {
+                        self.advance_track(ctx, false);
+                    } else if let Some(audio) = &mut self.audio {
+                        audio.toggle_play_pause();
+                    }
+                }
+                HardwareMediaCmd::Next => self.advance_track(ctx, false),
+                HardwareMediaCmd::Previous => self.play_previous(ctx),
+                HardwareMediaCmd::Stop => {
+                    if let Some(audio) = &mut self.audio {
+                        audio.stop();
+                    }
+                }
+            }
+        }
+
         let finished = self.audio.as_ref().map(|a| a.is_finished()).unwrap_or(false);
         if finished {
             self.advance_track(ctx, true);
@@ -1033,6 +1174,8 @@ impl eframe::App for RustifyApp {
 
         if playback_state == PlaybackState::Playing {
             ctx.request_repaint_after(Duration::from_millis(60));
+        } else if playback_state == PlaybackState::Paused {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         let elapsed = self
@@ -1041,6 +1184,10 @@ impl eframe::App for RustifyApp {
             .map(|a| a.position())
             .unwrap_or(Duration::ZERO);
         let elapsed_secs = elapsed.as_secs();
+
+        if let Some(bridge) = &mut self.media_bridge {
+            bridge.set_playback(playback_state, elapsed);
+        }
 
         // Accumulate listening seconds and count a play after 10 seconds of active playback
         if playback_state == PlaybackState::Playing && elapsed_secs != self.last_tick_second {
@@ -1310,7 +1457,7 @@ impl eframe::App for RustifyApp {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             let scanned = library::scan_folder(&folder);
                             let paths: Vec<PathBuf> = scanned.into_iter().map(|t| t.path).collect();
-                            self.import_audio_files(paths);
+                            self.import_audio_files(paths, None);
                         }
                     }
 
@@ -1327,7 +1474,7 @@ impl eframe::App for RustifyApp {
                             .add_filter("Audio Files", &["mp3", "flac", "wav", "ogg", "m4a", "aac"])
                             .pick_files()
                         {
-                            self.import_audio_files(files);
+                            self.import_audio_files(files, None);
                         }
                     }
                 });
@@ -1480,7 +1627,7 @@ impl eframe::App for RustifyApp {
                                 "Your library is empty.\nClick '+ FOLDER' or '+ FILES' in the sidebar to import local music."
                             }
                             ActiveView::Playlist(_) => {
-                                "This playlist has no songs yet.\nClick '+ ADD SONGS' above or use '+ PL' in ALL SONGS."
+                                "This playlist has no songs yet.\nClick '+ ADD SONGS', '+ FOLDER', or '+ FILES' above."
                             }
                         };
                         ui.label(RichText::new(msg).color(Color32::GRAY));
